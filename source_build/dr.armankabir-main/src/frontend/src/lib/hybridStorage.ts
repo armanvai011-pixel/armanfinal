@@ -1,12 +1,17 @@
-// ─── Hybrid Storage Layer (PHP+MySQL) ────────────────────────────────────────
-// All data is now persisted server-side via the PHP/MySQL API.
-// This file acts as a thin compatibility shim — it provides the same exports
-// that components expect, but delegates reads/writes to the PHP backend.
-// localStorage is no longer the primary data store.
+/**
+ * Server-backed storage compatibility layer.
+ *
+ * The former implementation mirrored Canister/ICP state in a client-side
+ * store and synchronised it later. That model is intentionally gone:
+ * browser storage, Caffeine, actors, queues, and conflict resolution are not
+ * used here. PHP session cookies authenticate requests and MySQL is the only
+ * source of truth.
+ *
+ * New code should use the domain services in `services/` and React Query.
+ * These exports remain only for older callers while they are migrated.
+ */
 
-import { get, post, del as apiDelete } from './api';
-
-// ─── Queue item types (kept for type compatibility) ──────────────────────────
+import { get, post } from './apiClient';
 
 export type SyncQueueItemType =
   | 'upsertPatient'
@@ -54,69 +59,21 @@ export interface MigrationProgress {
   message: string;
 }
 
-// ─── No-op stubs (features no longer needed) ─────────────────────────────────
+/** Legacy queue/conflict APIs deliberately do nothing: writes are immediate API writes. */
+export function enqueueSync(_item: SyncQueueItem): void {}
+export function removeFromQueue(_type: string, _ids: Set<string>): void {}
+export function loadSyncQueue(): SyncQueueItem[] { return []; }
+export function getConflicts(): SyncConflict[] { return []; }
+export function getConflictsCount(): number { return 0; }
+export function addConflict(_conflict: SyncConflict): void {}
+export function resolveConflict(_entityId: string, _choice: 'mine' | 'theirs'): void {}
+export function isMigrationDone(): boolean { return true; }
+export function markMigrationDone(): void {}
+export function getDeviceId(): string { return 'php-session'; }
+export function setLastSyncTs(_ts: number): void {}
+export function getPendingChangesCount(): number { return 0; }
 
-export function enqueueSync(_item: SyncQueueItem): void {
-  // Sync queue removed — all writes go directly to PHP API
-}
-
-export function removeFromQueue(_type: string, _ids: Set<string>): void {
-  // Sync queue removed
-}
-
-export function loadSyncQueue(): SyncQueueItem[] {
-  return [];
-}
-
-export function getConflicts(): SyncConflict[] {
-  return [];
-}
-
-export function getConflictsCount(): number {
-  return 0;
-}
-
-export function addConflict(_conflict: SyncConflict): void {
-  // Not needed with server-authoritative storage
-}
-
-export function resolveConflict(
-  _entityId: string,
-  _choice: 'mine' | 'theirs',
-): void {
-  // Not needed — server is source of truth
-}
-
-export function isMigrationDone(): boolean {
-  return true;
-}
-
-export function markMigrationDone(): void {
-  // No migration needed
-}
-
-export function getDeviceId(): string {
-  return 'php-mysql-' + Date.now();
-}
-
-function getLastSyncTs(): number {
-  return 0n;
-}
-
-export function setLastSyncTs(_ts: number): void {
-  // No sync needed
-}
-
-export function getPendingChangesCount(): number {
-  return 0;
-}
-
-// ─── Frontpage content — PHP API backed ──────────────────────────────────────
-
-export async function saveFrontPageContentWithSync(): Promise<void> {
-  // Content saving is handled by useSiteConfig via the PHP API
-}
-
+/** Read/write the server-side front-page settings stored in MySQL. */
 export async function loadFrontPageContentFromServer(): Promise<Record<string, unknown> | null> {
   try {
     return await get<Record<string, unknown>>('/frontpage/get.php');
@@ -136,41 +93,65 @@ export async function saveFrontPageContentToServer(
   }
 }
 
-// ─── Clinical entity storage (now uses PHP API) ─────────────────────────────
-
-const CLINICAL_STORE_KEY = 'medicare_clinical_data';
-
-export function getClinicalStore(): Record<string, unknown[]> {
-  return {};
+/**
+ * Compatibility name for old callers. The old actor argument is intentionally
+ * absent; authentication is provided by the PHP session cookie.
+ */
+export async function saveFrontPageContentWithSync(
+  data: Record<string, unknown>,
+): Promise<void> {
+  if (!(await saveFrontPageContentToServer(data))) {
+    throw new Error('Unable to save front-page content through the PHP API');
+  }
 }
 
-export function getClinicalEntities(_entityType: string): unknown[] {
-  return [];
+const CLINICAL_ENDPOINTS: Record<string, { list: string; create: string }> = {
+  encounters: { list: '/clinical/encounters-list.php', create: '/clinical/encounters-create.php' },
+  observations: { list: '/clinical/observations-list.php', create: '/clinical/observations-create.php' },
+  notes: { list: '/clinical/notes-list.php', create: '/clinical/notes-create.php' },
+  orders: { list: '/clinical/orders-list.php', create: '/clinical/orders-create.php' },
+  beds: { list: '/beds/list.php', create: '/beds/create.php' },
+};
+
+/** Fetch a clinical collection from PHP/MySQL. */
+export async function getClinicalEntities(
+  entityType: string,
+  patientId?: number,
+): Promise<unknown[]> {
+  const endpoint = CLINICAL_ENDPOINTS[entityType];
+  if (!endpoint) throw new Error(`No PHP API endpoint is registered for ${entityType}`);
+  const result = await get<unknown[] | { items?: unknown[] }>(endpoint.list,
+    patientId === undefined ? undefined : { patientId });
+  return Array.isArray(result) ? result : result.items ?? [];
 }
 
-export function saveClinicalEntities(_entityType: string, _items: unknown[]): void {
-  // Clinical data goes directly to PHP API endpoints
+/** Create one server-side clinical record; IDs are generated by MySQL. */
+export async function createClinicalEntity(
+  entityType: string,
+  data: Record<string, unknown>,
+): Promise<unknown> {
+  const endpoint = CLINICAL_ENDPOINTS[entityType];
+  if (!endpoint) throw new Error(`No PHP API endpoint is registered for ${entityType}`);
+  return post(endpoint.create, data);
 }
 
-export function saveClinicalEntitiesWithSync(
-  _entityType: string,
-  _items: unknown[],
-): void {
-  // Clinical data goes directly to PHP API endpoints
+/**
+ * The former whole-store API cannot be implemented safely without reintroducing
+ * a client database. Callers must use a domain service or createClinicalEntity.
+ */
+export function getClinicalStore(): never {
+  throw new Error('Clinical data must be read from PHP/MySQL domain APIs');
+}
+export function saveClinicalEntities(_entityType: string, _items: unknown[]): never {
+  throw new Error('Clinical data must be written through PHP/MySQL domain APIs');
+}
+export function saveClinicalEntitiesWithSync(_entityType: string, _items: unknown[]): never {
+  throw new Error('Clinical data must be written through PHP/MySQL domain APIs');
+}
+export function nextClinicalId(_items: { id?: unknown }[]): never {
+  throw new Error('Clinical IDs are generated by MySQL');
 }
 
-export function nextClinicalId(_items: { id?: unknown }[]): number {
-  return 1n;
-}
-
-// ─── Bootstrap — no-op ───────────────────────────────────────────────────────
-
-export async function bootstrapFromCanister(): Promise<void> {
-  // No canister — all data is PHP/MySQL
-}
-
-// ─── Content offline queue — no-op ──────────────────────────────────────────
-
-export async function flushContentQueue(): Promise<void> {
-  // No offline queue
-}
+/** Kept as an async compatibility hook; there is no client-side bootstrap. */
+export async function bootstrapFromCanister(): Promise<void> {}
+export async function flushContentQueue(): Promise<void> {}
